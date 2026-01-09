@@ -87,7 +87,10 @@ Public broker + unique topics. History stored in your browser (IndexedDB).
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
 <script>
-/*** ---------- CONFIG (Mosquitto test broker) ---------- ***/
+/*** ---------- CONFIG (FreeMQTT) ---------- 
+const MQTT_URL = "wss://broker.freemqtt.com:8084/mqtt";
+const MQTT_USER = "freemqtt";
+const MQTT_PASS = "public";***/
 const MQTT_URL = "wss://test.mosquitto.org:8081/mqtt";
 const MQTT_USER = "";
 const MQTT_PASS = "";
