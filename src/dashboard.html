@@ -1,0 +1,366 @@
+<!doctype html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Water Monitor</title>
+  <style>
+    body{font-family:system-ui,Arial;margin:16px;max-width:980px}
+    .row{display:flex;gap:12px;flex-wrap:wrap}
+    .card{border:1px solid #ddd;border-radius:14px;padding:14px;flex:1;min-width:260px}
+    .big{font-size:34px;font-weight:800}
+    button{padding:10px 14px;border-radius:10px;border:1px solid #333;background:#fff;margin:6px 6px 0 0}
+    select,input{padding:8px;border-radius:10px;border:1px solid #ccc}
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:8px;border-bottom:1px solid #eee;text-align:left;font-size:14px}
+    .muted{color:#666}
+  </style>
+</head>
+<body>
+<h2>Water Monitor (MQTT)</h2>
+<div class="muted">
+Public broker + unique topics. History stored in your browser (IndexedDB).
+</div>
+
+<div class="row" style="margin-top:12px">
+  <div class="card">
+    <div class="muted">Valve</div>
+    <div id="valve" class="big">--</div>
+    <button onclick="sendValve(true)">Open</button>
+    <button onclick="sendValve(false)">Close</button>
+    <button onclick="sendReset()">Reset Total</button>
+  </div>
+
+  <div class="card">
+    <div class="muted">Flow</div>
+    <div><span id="flow" class="big">--</span> <span class="muted">L/min</span></div>
+    <div class="muted" style="margin-top:8px">Total</div>
+    <div><span id="total" class="big">--</span> <span class="muted">L</span></div>
+  </div>
+
+  <div class="card">
+    <div class="muted">Settings</div>
+    <div style="margin-top:8px">
+      <label>Topic Base</label><br/>
+      <input id="base" style="width:100%" />
+    </div>
+    <div style="margin-top:10px">
+      <label>Resolution</label><br/>
+      <select id="res" onchange="reloadChart()">
+        <option value="1">1 sec</option>
+        <option value="10">10 sec</option>
+        <option value="60" selected>1 min</option>
+        <option value="300">5 min</option>
+      </select>
+    </div>
+    <div style="margin-top:10px">
+      <label>Min usage event (Liters)</label><br/>
+      <input id="minEvent" type="number" value="5" step="0.5" />
+    </div>
+    <button onclick="clearHistory()">Clear History</button>
+  </div>
+</div>
+
+<div class="card" style="margin-top:12px">
+  <div class="row" style="align-items:center">
+    <div style="flex:1">
+      <div class="muted">History graph</div>
+      <div class="muted">Shows Total liters over time (downsampled by resolution)</div>
+    </div>
+    <button onclick="reloadChart()">Refresh graph</button>
+    <button onclick="exportCSV()">Export CSV</button>
+  </div>
+  <canvas id="chart" height="120"></canvas>
+</div>
+
+<div class="card" style="margin-top:12px">
+  <div class="muted">Usage events (≥ threshold)</div>
+  <div class="muted">An event starts when flow rises above ~0 and ends after 30s of no flow.</div>
+  <table>
+    <thead>
+      <tr><th>Start time</th><th>Duration</th><th>Liters</th></tr>
+    </thead>
+    <tbody id="events"></tbody>
+  </table>
+</div>
+
+<script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<script>
+/*** ---------- CONFIG (Mosquitto test broker) ---------- ***/
+const MQTT_URL = "wss://test.mosquitto.org:8081/mqtt";
+const MQTT_USER = "";
+const MQTT_PASS = "";
+
+/*** ---------- DEFAULT TOPIC BASE ---------- ***/
+const DEFAULT_BASE = "ziv_water_9f3a72e1b8c44c2a";
+
+/*** ---------- TOPICS ---------- ***/
+function topics(base){
+  return {
+    cmdValve: `${base}/cmd/valve`,
+    cmdReset: `${base}/cmd/reset`,
+    sValve: `${base}/state/valve`,
+    sFlow: `${base}/state/flow_lpm`,
+    sTotal: `${base}/state/total_l`,
+    sTs: `${base}/state/ts`
+  };
+}
+
+/*** ---------- IndexedDB (history “without limit”) ---------- ***/
+const DB_NAME = "water_history_db";
+const DB_VER = 1;
+let db;
+
+function openDB(){
+  return new Promise((resolve, reject)=>{
+    const req = indexedDB.open(DB_NAME, DB_VER);
+    req.onupgradeneeded = (e)=>{
+      const db = e.target.result;
+      if(!db.objectStoreNames.contains("samples")){
+        const st = db.createObjectStore("samples", { keyPath: "id", autoIncrement: true });
+        st.createIndex("ts", "ts", { unique:false });
+      }
+      if(!db.objectStoreNames.contains("events")){
+        const ev = db.createObjectStore("events", { keyPath: "id", autoIncrement: true });
+        ev.createIndex("startTs", "startTs", { unique:false });
+      }
+    };
+    req.onsuccess = ()=>resolve(req.result);
+    req.onerror = ()=>reject(req.error);
+  });
+}
+
+function addSample(sample){
+  return new Promise((resolve,reject)=>{
+    const tx = db.transaction(["samples"], "readwrite");
+    tx.objectStore("samples").add(sample);
+    tx.oncomplete = ()=>resolve();
+    tx.onerror = ()=>reject(tx.error);
+  });
+}
+
+function addEvent(ev){
+  return new Promise((resolve,reject)=>{
+    const tx = db.transaction(["events"], "readwrite");
+    tx.objectStore("events").add(ev);
+    tx.oncomplete = ()=>resolve();
+    tx.onerror = ()=>reject(tx.error);
+  });
+}
+
+function getAllSamples(){
+  return new Promise((resolve,reject)=>{
+    const tx = db.transaction(["samples"], "readonly");
+    const st = tx.objectStore("samples");
+    const req = st.getAll();
+    req.onsuccess = ()=>resolve(req.result);
+    req.onerror = ()=>reject(req.error);
+  });
+}
+
+function getAllEvents(){
+  return new Promise((resolve,reject)=>{
+    const tx = db.transaction(["events"], "readonly");
+    const st = tx.objectStore("events");
+    const req = st.getAll();
+    req.onsuccess = ()=>resolve(req.result);
+    req.onerror = ()=>reject(req.error);
+  });
+}
+
+async function clearHistory(){
+  if(!confirm("Clear ALL stored history + events?")) return;
+  await new Promise((resolve,reject)=>{
+    const tx = db.transaction(["samples","events"], "readwrite");
+    tx.objectStore("samples").clear();
+    tx.objectStore("events").clear();
+    tx.oncomplete = ()=>resolve();
+    tx.onerror = ()=>reject(tx.error);
+  });
+  await reloadChart();
+  await renderEvents();
+}
+
+/*** ---------- UI ---------- ***/
+const elValve = document.getElementById("valve");
+const elFlow  = document.getElementById("flow");
+const elTotal = document.getElementById("total");
+const elBase  = document.getElementById("base");
+const elRes   = document.getElementById("res");
+const elMinEvent = document.getElementById("minEvent");
+const elEvents = document.getElementById("events");
+
+elBase.value = localStorage.getItem("topic_base") || DEFAULT_BASE;
+
+function fmtTime(ts){
+  return new Date(ts*1000).toLocaleString();
+}
+function fmtDur(sec){
+  const m = Math.floor(sec/60), s = sec%60;
+  return `${m}m ${s}s`;
+}
+
+/*** ---------- MQTT ---------- ***/
+let client;
+let cur = { valve:"--", flow:null, total:null, ts:null };
+
+function connectMQTT(){
+  const base = elBase.value.trim();
+  localStorage.setItem("topic_base", base);
+  const t = topics(base);
+
+  client = mqtt.connect(MQTT_URL, {
+    username: MQTT_USER,
+    password: MQTT_PASS,
+    reconnectPeriod: 2000
+  });
+
+  client.on("connect", ()=>{
+    client.subscribe([t.sValve, t.sFlow, t.sTotal, t.sTs]);
+    console.log("MQTT connected");
+  });
+
+  client.on("message", async (topic, payload)=>{
+    const msg = payload.toString();
+    if(topic === t.sValve) cur.valve = msg;
+    if(topic === t.sFlow)  cur.flow  = parseFloat(msg);
+    if(topic === t.sTotal) cur.total = parseFloat(msg);
+    if(topic === t.sTs)    cur.ts    = parseInt(msg,10);
+
+    // update UI live
+    elValve.textContent = cur.valve;
+    if(cur.flow != null)  elFlow.textContent  = cur.flow.toFixed(2);
+    if(cur.total != null) elTotal.textContent = cur.total.toFixed(3);
+
+    // store sample only when we have flow+total
+    if(cur.flow != null && cur.total != null){
+      // Use browser time as primary (more reliable on public brokers)
+      const ts = Math.floor(Date.now()/1000);
+      await handleUsageEvent(ts, cur.flow, cur.total);
+      await addSample({ ts, flow: cur.flow, total: cur.total, valve: cur.valve });
+    }
+  });
+
+  client.on("error", (e)=>console.log("MQTT error", e));
+}
+
+function sendValve(open){
+  const base = elBase.value.trim();
+  const t = topics(base);
+  client.publish(t.cmdValve, open ? "OPEN" : "CLOSE");
+}
+function sendReset(){
+  const base = elBase.value.trim();
+  const t = topics(base);
+  client.publish(t.cmdReset, "1");
+}
+
+/*** ---------- Usage Event Detection (>= 5L) ---------- ***/
+// Event starts when flow > ACTIVE_FLOW. Ends after INACTIVE_GRACE seconds below it.
+const ACTIVE_FLOW = 0.2;          // L/min threshold to consider "running"
+const INACTIVE_GRACE = 30;        // seconds of quiet to close event
+let eventOpen = null;             // {startTs, startTotal, lastActiveTs}
+
+async function handleUsageEvent(ts, flowLpm, totalL){
+  const minLiters = parseFloat(elMinEvent.value || "5");
+
+  if(flowLpm > ACTIVE_FLOW){
+    if(!eventOpen){
+      eventOpen = { startTs: ts, startTotal: totalL, lastActiveTs: ts };
+    } else {
+      eventOpen.lastActiveTs = ts;
+    }
+  } else {
+    if(eventOpen && (ts - eventOpen.lastActiveTs) >= INACTIVE_GRACE){
+      const liters = totalL - eventOpen.startTotal;
+      const dur = ts - eventOpen.startTs;
+      if(liters >= minLiters){
+        await addEvent({ startTs: eventOpen.startTs, endTs: ts, liters, durationSec: dur });
+      }
+      eventOpen = null;
+      await renderEvents();
+    }
+  }
+}
+
+/*** ---------- Chart ---------- ***/
+let chart;
+
+function downsample(samples, stepSec){
+  // samples are irregular-ish. We bucket by stepSec and take last total in each bucket.
+  const buckets = new Map();
+  for(const s of samples){
+    const b = Math.floor(s.ts / stepSec) * stepSec;
+    buckets.set(b, s); // overwrite -> keep last
+  }
+  const xs = [...buckets.keys()].sort((a,b)=>a-b);
+  return xs.map(ts => ({ ts, total: buckets.get(ts).total }));
+}
+
+async function reloadChart(){
+  const samples = await getAllSamples();
+  const step = parseInt(elRes.value, 10);
+  const ds = downsample(samples, step);
+
+  const labels = ds.map(p=> new Date(p.ts*1000).toLocaleTimeString());
+  const data = ds.map(p=> p.total);
+
+  const ctx = document.getElementById("chart").getContext("2d");
+  if(chart) chart.destroy();
+  chart = new Chart(ctx, {
+    type: "line",
+    data: { labels, datasets: [{ label: "Total Liters", data, tension: 0.2 }] },
+    options: {
+      responsive: true,
+      scales: {
+        x: { ticks: { maxTicksLimit: 10 } },
+        y: { beginAtZero: true }
+      }
+    }
+  });
+
+  await renderEvents();
+}
+
+async function renderEvents(){
+  const events = await getAllEvents();
+  events.sort((a,b)=>b.startTs-a.startTs);
+
+  elEvents.innerHTML = "";
+  for(const e of events.slice(0, 200)){ // show last 200, still stored unlimited
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${fmtTime(e.startTs)}</td>
+      <td>${fmtDur(e.durationSec)}</td>
+      <td>${e.liters.toFixed(2)}</td>
+    `;
+    elEvents.appendChild(tr);
+  }
+}
+
+/*** ---------- Export CSV ---------- ***/
+async function exportCSV(){
+  const samples = await getAllSamples();
+  let csv = "ts_iso,ts_epoch,flow_lpm,total_l,valve\n";
+  for(const s of samples){
+    csv += `${new Date(s.ts*1000).toISOString()},${s.ts},${s.flow},${s.total},${s.valve}\n`;
+  }
+  const blob = new Blob([csv], {type:"text/csv"});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "water_history.csv";
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+/*** ---------- Boot ---------- ***/
+(async function(){
+  db = await openDB();
+  connectMQTT();
+  await reloadChart();
+})();
+</script>
+</body>
+</html>
